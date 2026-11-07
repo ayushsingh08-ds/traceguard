@@ -47,3 +47,5 @@ dist-ssr/
 *.swo
 .DS_Store
 Thumbs.db
+
+INTERVIEW_MASTERGUIDE.md

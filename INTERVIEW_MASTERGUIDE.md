@@ -252,3 +252,94 @@ If `sla_deadline_at` were placed first, the engine would have to scan a range of
 
 **Q3: How does the schema architecture prevent LLM hallucinations from corrupting the database?**
 *Answer:* The LLM does not execute direct database writes. Its response must conform to the strict `RootCauseReport` schema. If the model outputs malformed JSON, missing fields, a confidence score outside `[0.0, 1.0]`, or an empty list of supporting evidence, Pydantic's strict validation immediately rejects the payload. The failure is caught by our retry/fallback handler before any state change occurs in `rca_reports`.
+
+
+
+---
+
+## Phase 2 Modules: Engineering Deep Dive
+
+### 5. `backend/app/ingestion/` (Strategy Pattern & Registry)
+
+#### The Engineering "Why"
+- **Open-Closed Principle (OCP):** Microservices and infrastructure emit alerts across dozens of monitoring providers (Prometheus Alertmanager, AWS CloudWatch, Datadog, Grafana, custom internal loggers). By implementing `AlertParserStrategy` with polymorphic `can_parse()` and `parse()` methods, we can add support for new monitoring systems by writing a single strategy class without modifying the webhook ingestion endpoint or database logic.
+- **Ordered Strategy Precedence:** In `AlertParserRegistry`, strategies are evaluated by specificity. Dedicated vendor formats with distinct signatures (e.g., Prometheus `groupLabels`/`alerts`, AWS SNS `TopicArn`/`AlarmName`) are evaluated first, while the permissive `CustomAlertParser` serves as a fallback for generic JSON payloads.
+
+#### Failure Modes & Edge Cases
+- Nested AWS SNS string-escaped payloads: CloudWatch alarms delivered via AWS SNS wrap the inner CloudWatch JSON payload inside a stringified `"Message"` key. The `CloudWatchAlertParser` detects this and performs double-decoding, preventing ingestion crashes.
+- Malformed timestamps from disparate systems: Ingestion parsers sanitize ISO 8601 variations (e.g., converting `+0000` or trailing `Z` to `+00:00`) and fall back to monotonic UTC `datetime.now(timezone.utc)` if strings fail parsing.
+
+#### Interview Questions & Answers
+**Q1: Why choose the Strategy Pattern over a giant `if/elif/else` parsing function?**
+*Answer:* A monolithic conditional function violates the Single Responsibility and Open-Closed principles. Every new monitoring vendor requires editing the same function, bloating cyclomatic complexity and risking regression in existing alert pathways. The Strategy Pattern decouples vendor-specific parsing rules into isolated, independently unit-testable classes with a unified contract (`can_parse` and `parse`). Adding or deprecating an alert source requires zero changes to the core webhook controller.
+
+**Q2: What is the risk of having a generic fallback parser like `CustomAlertParser`, and how do we prevent false positives?**
+*Answer:* A fallback parser that matches any JSON payload could swallow malformed vendor payloads (e.g., a broken Prometheus alert falling into the custom parser and extracting generic `unknown-service` labels). We mitigate this by strictly ordering parser evaluation in the registry: highly specific structural checks are evaluated first. Furthermore, `CustomAlertParser` still enforces string length boundaries and schema validation when producing the immutable `IncidentEvent`.
+
+**Q3: How does normalizing the domain model at the ingestion perimeter protect the rest of the architecture?**
+*Answer:* By transforming heterogeneous vendor schemas immediately into the immutable `IncidentEvent` domain model at the boundary, downstream layers (the deduplicator, worker queue, database models, and RAG engine) remain completely agnostic of the ingestion source. Downstream services only ever interact with verified attributes (`service`, `title`, `severity`, `fingerprint`).
+
+---
+
+### 6. `backend/app/ingestion/deduplicator.py` (Redis ZSET Sliding-Window Deduplication)
+
+#### The Engineering "Why"
+- **Sliding-Window over Fixed-Window (Tumbling):** Fixed-window rate limiting resets counters at rigid time boundaries (e.g., every 5 minutes at `:00`, `:05`). A burst of 1,000 alerts arriving across the boundary (:04:59 and :05:01) would create two distinct incident tickets. The Redis `ZSET` sliding-window algorithm guarantees that every alert is evaluated relative to the exact preceding $N$ seconds (`now - window_seconds`), completely eliminating boundary surge artifacts.
+- **Atomic Multi-Command Pipelines:** The deduplication sequence requires four discrete Redis operations:
+  1. `ZREMRANGEBYSCORE(key, "-inf", window_start)` to evict expired timestamps.
+  2. `ZCARD(key)` to query the active count within the window.
+  3. `ZADD(key, {member: now})` to register the current alert.
+  4. `EXPIRE(key, ttl)` to ensure inactive keys are reclaimed by Redis memory management.
+  Executing these within `pipeline(transaction=True)` guarantees atomicity across distributed API replicas without requiring distributed Redis locks (`Redlock`).
+
+#### Failure Modes & Edge Cases
+- Redis Cluster outage or network partition: Production alert ingestion cannot halt simply because a cache node is temporarily unavailable. We implemented `InMemorySlidingWindowCache` as an automatic circuit-breaker fallback. If `RedisError` or `ConnectionError` is raised, execution degrades gracefully to an in-memory sliding window.
+- Timestamp collisions in `ZSET`: Sorted set members must be unique. If two identical alerts arrive in the same microsecond with identical timestamps, adding `{now: now}` would overwrite the member instead of incrementing cardinality. We guarantee member uniqueness by appending random UUID prefixes: `f"{now}:{uuid.uuid4().hex[:8]}"`.
+
+#### Interview Questions & Answers
+**Q1: Walk me through the exact Redis commands used in your sliding-window deduplicator and why `ZSET` is the optimal data structure.**
+*Answer:* We store alert occurrences in a Redis Sorted Set (`ZSET`) keyed by `tg:dedup:{fingerprint}`, where each element's score is its Unix epoch timestamp and the member is a unique string `f"{timestamp}:{salt}"`. We execute an atomic pipeline:
+1. `ZREMRANGEBYSCORE key -inf (now - window)`: Prunes all occurrences older than the sliding window in $O(\log N + M)$ time.
+2. `ZCARD key`: Returns the remaining occurrences within the active window in $O(1)$ time.
+3. `ZADD key now member`: Records the incoming alert in $O(\log N)$ time.
+4. `EXPIRE key ttl`: Sets a self-cleaning TTL.
+If `ZCARD` returned 0, this is the first occurrence (create ticket); if $> 0$, it is a duplicate (increment occurrence counter).
+
+**Q2: How does this approach scale when a service crash emits 10,000 alerts per second?**
+*Answer:* A crash burst of 10,000 alerts/sec with the same fingerprint generates 10,000 elements in a single `ZSET`. While memory consumption remains small (several kilobytes), constantly running `ZREMRANGEBYSCORE` and `ZCARD` on 10,000 elements introduces Redis CPU overhead. In ultra-high-volume architectures, we can pair this with a local in-process token bucket (e.g., dropping raw duplicates at the gateway layer for 500ms before hitting Redis) so Redis only handles the aggregated batch counts.
+
+**Q3: Why not use a simple Redis `INCR` with a `SETEX` key?**
+*Answer:* `SETEX` creates a fixed tumbling window. When the key is first created, its expiration timer begins. Any alert that arrives just before the expiration creates one ticket, and the next alert immediately after creates a second ticket. Furthermore, resetting `EXPIRE` on every `INCR` extends the window indefinitely, meaning a persistent trickle of 1 alert every 4 minutes would lock the deduplicator forever without ever evaluating a true sliding rate.
+
+---
+
+### 7. `backend/app/workers/priority_worker.py` (Concurrent Priority Worker Pool)
+
+#### The Engineering "Why"
+- **Lock-Free Concurrency via `SELECT ... FOR UPDATE SKIP LOCKED`:** In traditional queuing or worker architectures using standard relational tables, multiple worker threads running `SELECT ... FOR UPDATE` will block on each other when competing for rows. Under high worker concurrency, this causes "lock convoying," deadlocks, and serialized latency spikes. `SKIP LOCKED` instructs PostgreSQL to atomically lock available rows and skip any rows already locked by other transactions. This allows multiple distributed worker processes to drain the queue in parallel with zero lock contention.
+- **Preemptive Severity Priority Ordering:** When an incident storm hits production, the queue may be flooded with hundreds of `Sev-3` alerts. If workers processed tasks using strict FIFO (`ORDER BY created_at ASC`), a catastrophic `Sev-1` outage would be stuck waiting behind non-urgent alerts. We use SQL `CASE` ordering:
+  ```sql
+  ORDER BY
+    CASE severity
+      WHEN 'Sev-1' THEN 1
+      WHEN 'Sev-2' THEN 2
+      WHEN 'Sev-3' THEN 3
+      ELSE 4
+    END ASC,
+    sla_deadline_at ASC
+  ```
+  This guarantees that any available worker immediately selects and locks `Sev-1` incidents before even looking at `Sev-2` or `Sev-3` backlogs.
+
+#### Failure Modes & Edge Cases
+- Worker crash mid-task: Because row locks in PostgreSQL are bound to the transaction (`async with session.begin():`), if a worker container crashes, loses power, or is killed via `SIGKILL`, the PostgreSQL transaction terminates and automatically rolls back. The locked rows are immediately unlocked and returned to the queue for other workers to pick up without orphaned "in-progress" states.
+- Worker event-loop starvation: If a worker task handler encounters a network hang during external API calls, `asyncio.wait_for` timeout boundaries prevent worker threads from freezing indefinitely.
+
+#### Interview Questions & Answers
+**Q1: What is the fundamental difference between `SELECT ... FOR UPDATE` and `SELECT ... FOR UPDATE SKIP LOCKED`?**
+*Answer:* With `SELECT ... FOR UPDATE`, if Transaction B attempts to select rows that Transaction A has locked, Transaction B is blocked and waits until Transaction A commits or rolls back. If multiple workers are polling the top of the queue, all but one will freeze, causing severe lock contention and potential deadlocks. With `SKIP LOCKED`, PostgreSQL ignores any rows currently locked by other transactions and immediately returns the next available unlocked rows that satisfy the query. Workers never block each other.
+
+**Q2: Why use a relational database as a queue with `SKIP LOCKED` instead of an external message broker like RabbitMQ or Kafka?**
+*Answer:* Using Postgres with `SKIP LOCKED` guarantees **transactional consistency** between incident state transitions and business entity updates. In a dual-system architecture (e.g., PostgreSQL for data and RabbitMQ for queues), an application must solve the Dual Write Problem: if the DB write succeeds but the queue publish fails, data is lost; if the queue message is consumed before the DB commit finishes, workers process non-existent records. With `SKIP LOCKED`, the incident creation, audit logging, and queue status are part of the exact same ACID transaction.
+
+**Q3: How does the composite index `(status, severity, sla_deadline_at)` created in Phase 1 support this worker query?**
+*Answer:* The worker query filters by `status = 'TRIGGERED'`, orders by `severity` rank, and then orders by `sla_deadline_at`. Because the composite index has `status` first and `severity` and `sla_deadline_at` next, PostgreSQL can navigate directly to the unacknowledged records in index order without performing a full-table sequential scan, keeping worker polling overhead under 1 millisecond even with millions of historical incidents in the table.

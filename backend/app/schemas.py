@@ -195,3 +195,4 @@ class UserResponse(BaseModel):
     username: str
     role: str
     created_at: datetime
+
