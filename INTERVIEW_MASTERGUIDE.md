@@ -508,3 +508,124 @@ If `ZCARD` returned 0, this is the first occurrence (create ticket); if $> 0$, i
 
 **Q3: How does FastAPI's `OAuth2PasswordBearer` interact with OpenAPI Swagger documentation?**
 *Answer:* `OAuth2PasswordBearer(tokenUrl=...)` registers a security scheme in FastAPI's generated OpenAPI specification (`/api/v1/openapi.json`). This automatically renders an "Authorize" button in Swagger UI (`/docs`), allowing engineers and API clients to log in and automatically inject the `Authorization: Bearer <token>` header across all protected test endpoints.
+
+
+---
+
+## Phase 5 Modules: Engineering Deep Dive
+
+### 15. `frontend/src/types/incident.ts` (Discriminated Unions & Impossible State Prevention)
+
+#### The Engineering "Why"
+- **Making Impossible States Unrepresentable:** Traditional state modeling often uses loose flags:
+  ```typescript
+  // Fragile anti-pattern:
+  interface DiagnosticState {
+    isLoading: boolean;
+    isError: boolean;
+    error?: string;
+    report?: RootCauseReport;
+    activeTool?: string;
+  }
+  ```
+  This permits 32 combinatorial permutations, including illegal states such as `isLoading: true` while `report` is populated and `isError: true`. We model the diagnostic lifecycle as a **Discriminated Union**:
+  ```typescript
+  export type DiagnosticExecutionState =
+    | { status: "idle" }
+    | { status: "running"; activeTool: string }
+    | { status: "completed"; report: RootCauseReport }
+    | { status: "failed"; error: string };
+  ```
+  TypeScript's compiler strictly enforces that when `status === "completed"`, `report` is guaranteed to exist without optional chaining (`report?.hypothesis`), and `activeTool` cannot compile.
+- **Strict Domain Parity with Backend:** TypeScript interfaces directly mirror Pydantic v2 schemas (`IncidentListItem`, `RootCauseReport`, `SLAMetrics`), ensuring full end-to-end type safety with zero `any` types.
+
+#### Failure Modes & Edge Cases
+- Unhandled discriminator branches in `switch` statements: TypeScript exhaustiveness checking (using `never` type assertions) guarantees that adding a new diagnostic state (e.g., `"paused"`) fails compilation until all UI renderers handle it.
+
+#### Interview Questions & Answers
+**Q1: What is a Discriminated Union in TypeScript and why is it superior to boolean flags for state machines?**
+*Answer:* A Discriminated Union (tagged union) is a set of object types sharing a common literal property (the discriminator, e.g., `status: "idle" | "running" | "completed" | "failed"`). With boolean flags (`isLoading`, `isError`, `isSuccess`), the compiler allows contradictory states like `{ isLoading: true, isError: true }`. A discriminated union ensures mutually exclusive states: narrowing on `state.status === "completed"` guarantees `state.report` exists without null checks, eliminating runtime `TypeError: cannot read property of undefined` errors.
+
+**Q2: How do you enforce compile-time exhaustiveness checking on discriminated unions?**
+*Answer:* In a `switch (state.status)` statement, we map the `default` case to a function expecting type `never`:
+```typescript
+function assertUnreachable(x: never): never {
+  throw new Error("Unhandled union member: " + JSON.stringify(x));
+}
+```
+If a developer adds a new state variant to the union and forgets to handle it in the UI switch block, TypeScript will raise a compilation error because the unhandled variant cannot be assigned to `never`.
+
+**Q3: Why avoid bloated third-party component libraries (e.g., Material UI, Ant Design) in production dashboards?**
+*Answer:* Heavy UI libraries bundle hundreds of kilobytes of unused JavaScript and introduce deeply nested DOM hierarchies with CSS-in-JS runtime overhead that degrades table rendering performance under high row counts. Handcrafted Tailwind CSS components with semantic HTML produce clean, accessible solid cards, maintain sub-100ms render cycles, and keep total client bundle size under 170KB.
+
+---
+
+### 16. `frontend/src/hooks/useIncidents.ts` (Race Condition Safety & Optimistic UI)
+
+#### The Engineering "Why"
+- **Race Condition Prevention via `AbortController`:** When an engineer rapidly switches filters (`Sev-1` $\to$ `Sev-2` $\to$ `All`), three asynchronous HTTP requests are fired. In standard fetch implementations, if request 1 takes 800ms and request 3 takes 200ms, request 1 finishes last and overwrites the state with stale `Sev-1` data. In `useIncidents`, `new AbortController()` inside `useEffect` with cleanup `return () => controller.abort()` actively cancels in-flight network requests before initiating the next filter fetch.
+- **Optimistic State Mutation with Rollback:** In high-stress triage, waiting 300ms for a network round-trip to see the "Acknowledge" button update creates perceived friction. We immediately update local state, snapshot the previous array, and dispatch the background `PATCH`. If the server returns a 500 or network timeout, the hook rolls back to the snapshot and surfaces an actionable error banner.
+
+#### Failure Modes & Edge Cases
+- Handling `AbortError`: When `fetch` is aborted, it raises an exception with `err.name === "AbortError"`. The catch handler explicitly intercepts `AbortError` and silences it rather than showing a false error toast to the user.
+- Network disconnection during optimistic updates: The rollback restores the previous state, preventing the UI from desynchronizing with the database.
+
+#### Interview Questions & Answers
+**Q1: Explain the exact mechanism by which `AbortController` prevents stale data race conditions in React `useEffect`.**
+*Answer:* When a dependency in `useEffect([filters])` changes, React executes the cleanup function returned by the previous effect execution before executing the new effect. By calling `controller.abort()` in that cleanup function, the browser cancels the prior in-flight HTTP request at the network socket layer. Even if the network response was already in transit, the `fetch` promise rejects with `AbortError` and is discarded, guaranteeing that only the most recently triggered request ever calls `setIncidents()`.
+
+**Q2: Walk me through your implementation of Optimistic UI updates with rollback.**
+*Answer:* The mutation function executes in three sequential steps:
+1. **Snapshot:** Deep-copies current state: `const previous = [...incidents]`.
+2. **Optimistic Mutation:** Immediately updates state locally via `setIncidents(prev => prev.map(...))` so the UI responds in 0ms.
+3. **Reconciliation or Rollback:** Awaits `apiClient.patch(...)`. If successful, it reconciles the server-returned timestamps; if the promise rejects, it immediately restores `setIncidents(previous)` and triggers an error notification.
+
+**Q3: Why not place the incident fetch call inside a global Redux or MobX store?**
+*Answer:* For view-specific data that depends directly on URL or UI filter state, keeping the fetch logic in a custom hook provides better encapsulation, automatic cleanup on unmount, and zero boilerplate. Redux introduces extraneous actions, reducers, and selectors for data that is only ever consumed within the incident command page.
+
+---
+
+### 17. `frontend/src/hooks/useSLACountdown.ts` (Isolated Render Boundaries)
+
+#### The Engineering "Why"
+- **Eliminating Full-Table Re-Render Bottlenecks:** An incident command table may display 50 active incidents, each with an active countdown timer updating every 1,000ms. If the timer interval were managed in the parent `App` or `IncidentTable` component, every 1-second tick would re-render the entire table, re-evaluating 50 rows, filter buttons, and headers 60 times a minute. By encapsulating `useSLACountdown` inside an isolated `<SLACountdownBadge>` component, the 1-second interval re-renders ONLY the individual badge node, preserving 60 FPS scrolling performance.
+- **Dynamic Badge State Escalation:** Ticks calculate real-time drift:
+  - Remaining $> 300\text{s}$: `"healthy"`
+  - Remaining $\le 300\text{s}$ (5 minutes): `"warning"`
+  - Remaining $\le 0\text{s}$: `"breached"` (renders negative drift like `-04m 12s BREACH` in bold red).
+
+#### Failure Modes & Edge Cases
+- Client clock drift: Ticking compares the server's UTC `sla_deadline_at` with client `Date.now()`. If a client clock is skewed by a few minutes, the badge reflects local perception, but backend enforcement remains authoritative on the server.
+- Resolved incidents: If `isResolved === true`, the timer interval is immediately cleared via early return, conserving browser CPU cycles.
+
+#### Interview Questions & Answers
+**Q1: How do high-frequency timer tickers affect React performance, and how did you prevent performance degradation?**
+*Answer:* Calling `setState` every 1,000ms in a top-level component triggers reconciliation across the entire Virtual DOM tree beneath it. For a 50-row table, this results in 3,000 component evaluations per minute. We isolated the ticker into a leaf component (`<SLACountdownBadge>`). When the 1-second timer fires, only that specific `<span>` is reconciled; the parent table and sibling cells remain untouched.
+
+**Q2: What is the risk of using `setInterval` in React, and how does your cleanup function prevent memory leaks?**
+*Answer:* If a component unmounts (e.g., switching pages or filtering out an incident) while an interval is running, the interval continues firing in the background. It holds a closure reference to the unmounted component's state, causing memory leaks and the React warning: "Can't perform a React state update on an unmounted component." Returning `() => clearInterval(interval)` in `useEffect` guarantees the timer is terminated the instant the badge unmounts.
+
+**Q3: How does the hook handle negative time when an SLA is breached?**
+*Answer:* When `remainingSeconds <= 0`, taking `Math.abs(remainingSeconds)` allows consistent formatting of elapsed hours, minutes, and seconds while prefixing the string with a minus sign (`-02m 45s BREACH`). The badge state shifts from `"warning"` to `"breached"`, triggering bold red styling.
+
+---
+
+### 18. `frontend/src/api/client.ts` (Zero-Dependency Protected Native Fetch Wrapper)
+
+#### The Engineering "Why"
+- **Zero-Dependency Native Fetch:** Third-party HTTP libraries like Axios add 30KB+ to the JavaScript bundle and introduce wrapper abstractions over standard Web APIs. A 90-line TypeScript wrapper around native `fetch` provides identical capability (JWT Bearer injection, URL query serialization, error normalization) with zero dependencies.
+- **Centralized 401 Session Interception:** When an authentication token expires, the client catches HTTP 401, purges `localStorage`, and throws a typed `ApiError(401, ...)` that allows UI components to prompt re-login without page reloads.
+
+#### Failure Modes & Edge Cases
+- Non-JSON server error responses (e.g., NGINX 502 Bad Gateway HTML pages): The client attempts `await response.json()` inside a `try...catch`. If parsing fails, it falls back to `response.statusText` instead of crashing with a `SyntaxError: Unexpected token < in JSON`.
+- Empty HTTP 204 No Content responses: Handled by returning `{}` rather than attempting to parse an empty body.
+
+#### Interview Questions & Answers
+**Q1: Why choose native `fetch` over Axios in modern web applications?**
+*Answer:* Native `fetch` is a web standard built into modern browsers and Node.js runtimes. Axios was originally essential for automatic JSON parsing, request cancellation, and Node HTTP support. Today, `fetch` supports `AbortController` for cancellation, `response.json()` for parsing, and requires zero external dependencies, reducing bundle size, build time, and supply-chain vulnerability attack surfaces.
+
+**Q2: How does the client handle query parameter serialization without third-party query-string libraries?**
+*Answer:* The client uses the native browser `URLSearchParams` API. It iterates through key-value pairs, ignores `undefined` values, and appends valid parameters before appending the generated query string to the base URL, handling URL-encoding of special characters natively.
+
+**Q3: What is the structure of `ApiError` and how does it improve debugging compared to raw Error instances?**
+*Answer:* `ApiError` extends the native `Error` class and adds explicit `status: number` and `details: unknown` fields. This enables UI catch blocks to check `err instanceof ApiError` and branch specifically on HTTP status codes (e.g., 401 Unauthorized vs 404 Not Found vs 422 Validation Error) rather than inspecting fragile error message strings.
