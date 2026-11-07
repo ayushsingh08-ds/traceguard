@@ -17,6 +17,9 @@ async def get_sla_metrics(
 ) -> SLAMetricsResponse:
     now = datetime.now(timezone.utc)
 
+    def to_utc(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
     # Single-pass SQL aggregation computes MTTA, MTTR, and breach counts simultaneously
     # without multiple round-trips or full-table memory loading.
     stmt = select(Incident)
@@ -35,14 +38,14 @@ async def get_sla_metrics(
         )
 
     ack_durations = [
-        (inc.acknowledged_at - inc.first_seen_at).total_seconds()
+        (to_utc(inc.acknowledged_at) - to_utc(inc.first_seen_at)).total_seconds()
         for inc in incidents
-        if inc.acknowledged_at and inc.acknowledged_at >= inc.first_seen_at
+        if inc.acknowledged_at and to_utc(inc.acknowledged_at) >= to_utc(inc.first_seen_at)
     ]
     resolve_durations = [
-        (inc.resolved_at - inc.first_seen_at).total_seconds()
+        (to_utc(inc.resolved_at) - to_utc(inc.first_seen_at)).total_seconds()
         for inc in incidents
-        if inc.resolved_at and inc.resolved_at >= inc.first_seen_at
+        if inc.resolved_at and to_utc(inc.resolved_at) >= to_utc(inc.first_seen_at)
     ]
 
     mtta = sum(ack_durations) / len(ack_durations) if ack_durations else 0.0
@@ -51,21 +54,21 @@ async def get_sla_metrics(
     active_incidents = [inc for inc in incidents if inc.status != IncidentStatus.RESOLVED]
     sev1_breaches = sum(
         1 for inc in active_incidents
-        if inc.severity == SeverityLevel.SEV1 and now > inc.sla_deadline_at
+        if inc.severity == SeverityLevel.SEV1 and now > to_utc(inc.sla_deadline_at)
     )
     sev2_breaches = sum(
         1 for inc in active_incidents
-        if inc.severity == SeverityLevel.SEV2 and now > inc.sla_deadline_at
+        if inc.severity == SeverityLevel.SEV2 and now > to_utc(inc.sla_deadline_at)
     )
     sev3_breaches = sum(
         1 for inc in active_incidents
-        if inc.severity == SeverityLevel.SEV3 and now > inc.sla_deadline_at
+        if inc.severity == SeverityLevel.SEV3 and now > to_utc(inc.sla_deadline_at)
     )
 
     breached_total = sum(
         1 for inc in incidents
-        if (inc.status != IncidentStatus.RESOLVED and now > inc.sla_deadline_at)
-        or (inc.resolved_at and inc.resolved_at > inc.sla_deadline_at)
+        if (inc.status != IncidentStatus.RESOLVED and now > to_utc(inc.sla_deadline_at))
+        or (inc.resolved_at and to_utc(inc.resolved_at) > to_utc(inc.sla_deadline_at))
     )
     compliance_rate = round(((len(incidents) - breached_total) / len(incidents)) * 100, 1)
 

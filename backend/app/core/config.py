@@ -35,9 +35,13 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: Optional[str] = None
     LLM_MODEL: str = "gemini-1.5-pro"
 
+    DATABASE_URL: Optional[str] = None
+
     @computed_field
     @property
     def ASYNC_DATABASE_URL(self) -> str:
+        if self.DATABASE_URL:
+            return self.DATABASE_URL
         return (
             f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
