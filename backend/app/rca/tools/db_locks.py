@@ -64,3 +64,4 @@ class CheckDatabaseLocksTool(DiagnosticTool):
             "blocked_transactions": blocked_tx,
             "has_deadlock": blocked_queries_count > 10,
         }
+

@@ -21,3 +21,4 @@ class DiagnosticTool(ABC):
     @abstractmethod
     async def execute(self, **kwargs: Any) -> Dict[str, Any]:
         pass
+

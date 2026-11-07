@@ -54,3 +54,4 @@ class InspectRecentDeploymentsTool(DiagnosticTool):
             },
             "is_suspect_deployment": True,
         }
+

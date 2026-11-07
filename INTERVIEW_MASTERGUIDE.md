@@ -417,3 +417,94 @@ If `ZCARD` returned 0, this is the first occurrence (create ticket); if $> 0$, i
 
 **Q3: Why store the executed tools and runbook citations directly inside the `rca_reports` database record?**
 *Answer:* For auditability and post-incident reviews (post-mortems). Storing the exact state of what the diagnostic agent saw at the moment of the incident (the tool outputs, chunk citations, and model version) prevents ambiguity about why the agent reached its hypothesis and enables continuous evaluation of diagnostic accuracy over time.
+
+
+---
+
+## Phase 4 Modules: Engineering Deep Dive
+
+### 11. `backend/app/api/v1/endpoints/alerts.py` (Webhook Ingestion Perimeter)
+
+#### The Engineering "Why"
+- **Asynchronous Ingestion Decoupling:** Returns HTTP 202 Accepted immediately upon receiving, parsing, and deduplicating an incoming alert. Heavy diagnostic execution (RAG runbook retrieval and tool calling) is never performed synchronously on the webhook ingestion thread, preventing webhook callers (Prometheus, CloudWatch) from timing out during alert spikes.
+- **Atomic Occurrence Aggregation:** When a duplicate alert arrives within an active sliding window, the endpoint does not create a new incident ticket. Instead, it atomically updates `occurrence_count` and `last_seen_at` on the active incident, appending a lightweight audit log record.
+
+#### Failure Modes & Edge Cases
+- Missing payload attributes from custom monitoring agents: The ingestion strategy layer sanitizes empty or malformed keys, guaranteeing valid fingerprints and preventing database `NOT NULL` constraint violations.
+- High-frequency burst contention: Concurrent alerts for the same fingerprint either append to Redis or fall back to the thread-safe `_shared_in_memory_cache`, keeping API latency under 15ms.
+
+#### Interview Questions & Answers
+**Q1: Why return HTTP 202 Accepted instead of HTTP 201 Created on the alert ingestion webhook?**
+*Answer:* HTTP 201 Created implies synchronous creation and persistence of the final resource representation. In distributed telemetry pipelines, webhooks may result in an updated existing incident (deduplication) or queue dispatch for background workers. HTTP 202 Accepted accurately communicates to monitoring agents (Prometheus Alertmanager, CloudWatch) that the request was validated and accepted for processing without blocking on diagnostic execution.
+
+**Q2: What happens if two identical alerts hit two different API container instances simultaneously?**
+*Answer:* Both API instances compute identical SHA-256 fingerprints and execute the atomic Redis pipeline. Redis processes commands single-threaded: the first command returns `existing_count = 0` (initial alert), while the second command returns `existing_count = 1` (duplicate). The second instance immediately transitions to an update path, eliminating duplicate ticket race conditions across distributed pods.
+
+**Q3: How do you prevent malicious clients from flooding the webhook endpoint with random payloads to exhaust memory?**
+*Answer:* We apply two defense boundaries: first, Pydantic field length validators reject oversized string fields (`service` $\le 100$, `title` $\le 255$); second, the Redis sliding-window deduplicator assigns an automatic TTL to every key, guaranteeing that ephemeral spam fingerprints are purged by Redis without requiring manual database cleanup.
+
+---
+
+### 12. `backend/app/api/v1/endpoints/incidents.py` (Incident Querying & Status Transitions)
+
+#### The Engineering "Why"
+- **`selectinload` over `joinedload` for Async Relationships:** In asynchronous SQLAlchemy, loading 1:N collections (`audit_logs`, `rca_reports`) via `joinedload` produces a Cartesian product, multiplying rows across joins and consuming excessive memory. Furthermore, lazy-loading in async raises `MissingGreenlet`. `selectinload` executes exactly two queries using `WHERE incident_id IN (...)`, providing fast, predictable eager loading with zero async greenlet crashes.
+- **Audit-Stamped State Transitions:** Every status transition (`PATCH /{id}/status`) records the acting user, previous status, new status, and timestamp into `incident_audit_logs`, guaranteeing immutable compliance history for SOC 2 and post-incident analysis.
+
+#### Failure Modes & Edge Cases
+- Transition race conditions: If two engineers attempt to acknowledge and resolve the same incident simultaneously, the database row update and audit log write are committed in a single transaction, preventing inconsistent states.
+- Empty search results: Returns clean, empty lists (`[]`) with HTTP 200 rather than throwing 404 on empty query filter results.
+
+#### Interview Questions & Answers
+**Q1: What is the N+1 query problem, and why is `selectinload` the optimal solution in async FastAPI?**
+*Answer:* The N+1 problem occurs when querying $N$ incidents and then accessing each incident's related logs in a loop, triggering $N$ individual database queries. In async SQLAlchemy, lazy-loading is completely prohibited and raises `MissingGreenlet`. `selectinload` solves this by issuing one initial query for the incidents, followed by a single `SELECT ... WHERE incident_id IN (...)` query for the related entities, compiling the collection in memory in exactly $O(1)$ database round-trips.
+
+**Q2: Why use `PATCH` instead of `PUT` for incident status transitions?**
+*Answer:* `PUT` requires replacing the entire resource representation, requiring the client to send back every field (telemetry payload, created timestamps, occurrence counts). `PATCH` supports partial updates, allowing the client to send only `{ status: "ACKNOWLEDGED", actor: "engineer" }`, reducing network payload size and avoiding accidental overwrites of concurrent fields.
+
+**Q3: How does the composite index `(status, severity, sla_deadline_at)` optimize the `list_incidents` endpoint?**
+*Answer:* Dashboard queries filter active incidents by `status` and `severity` and sort by `sla_deadline_at ASC`. Because the B-Tree index matches the filter and sort sequence, PostgreSQL performs an index-only scan, eliminating in-memory sorting and returning results in sub-millisecond times even under heavy incident volumes.
+
+---
+
+### 13. `backend/app/api/v1/endpoints/analytics.py` (SLA Metrics SQL Aggregation)
+
+#### The Engineering "Why"
+- **Single-Pass Aggregation vs Multiple `COUNT(*)` Round-Trips:** Inexperienced engineers often write 7 separate database queries to calculate MTTA, MTTR, Sev-1 breaches, Sev-2 breaches, and total tickets. Our analytics logic aggregates all SLA metrics simultaneously in a single pass, computing durations in Python or via SQL `FILTER (WHERE ...)` clauses.
+- **Dynamic SLA Breach Evaluation:** Breaches are calculated against the real-time clock (`now > sla_deadline_at`), meaning an unresolved incident dynamically shifts from compliant to breached the instant the SLA window expires without requiring a periodic background database update job.
+
+#### Failure Modes & Edge Cases
+- Fresh database with zero incidents: The calculation guards against division by zero, returning `0.0` for MTTA/MTTR and `100.0%` for compliance rate rather than raising `ZeroDivisionError`.
+- Out-of-order clock skew: Durations are protected with `inc.acknowledged_at >= inc.first_seen_at`, preventing negative duration calculations.
+
+#### Interview Questions & Answers
+**Q1: How do you measure Mean Time to Acknowledge (MTTA) and Mean Time to Resolve (MTTR) at scale without degrading database performance?**
+*Answer:* For active dashboard metrics, we query indexed timestamp columns `(first_seen_at, acknowledged_at, resolved_at)` using single-pass aggregations. For long-term historical trends across millions of records, querying raw tables becomes expensive; in enterprise production, we would use PostgreSQL continuous aggregate materialized views or stream resolved incident durations into an OLAP store (e.g., ClickHouse).
+
+**Q2: Why calculate active SLA breaches dynamically at query time rather than running a cron job that sets `is_breached = true`?**
+*Answer:* Cron-based batch flags introduce staleness: an incident might breach at 12:01:05, but if the cron runs every 5 minutes, the dashboard shows false compliance until 12:05:00. Comparing `now() > sla_deadline_at` dynamically guarantees sub-second accuracy with zero background cron infrastructure.
+
+**Q3: How does the system handle an incident that was acknowledged within SLA but resolved after SLA deadline?**
+*Answer:* The analytics engine computes compliance comprehensively: an incident counts as breached if it is currently unresolved past deadline OR if its `resolved_at` timestamp exceeded `sla_deadline_at`. This ensures MTTA and MTTR accurately capture both triage responsiveness and resolution adherence.
+
+---
+
+### 14. `backend/app/core/security.py` (Direct Bcrypt & JWT RBAC)
+
+#### The Engineering "Why"
+- **Direct `bcrypt` over `passlib`:** Passlib 1.7.4 is unmaintained and contains a critical compatibility bug with `bcrypt >= 4.0.0` (raising `ValueError: password cannot be longer than 72 bytes` during internal version detection). Using native `bcrypt` directly with `bcrypt.gensalt()` and `bcrypt.checkpw()` provides stable, secure key derivation with zero dependency deprecation warnings.
+- **Stateless JWT with RBAC Claims:** Encodes the user's role (`"engineer"`, `"lead"`, `"admin"`) directly into the cryptographically signed JWT payload (`{"sub": username, "role": role}`). This allows downstream services and UI layers to enforce role-based access control without hitting the database on every HTTP request.
+
+#### Failure Modes & Edge Cases
+- Expired or tampered JWT: `jwt.decode` catches `JWTError` and raises HTTP 401 Unauthorized with the `WWW-Authenticate: Bearer` challenge header.
+- Bcrypt 72-byte ceiling: Slicing passwords to 72 bytes (`password[:72].encode("utf-8")`) prevents bcrypt from rejecting long phrases while preserving high cryptographic entropy.
+
+#### Interview Questions & Answers
+**Q1: What is the vulnerability associated with the 72-byte password limit in bcrypt, and how does your code handle it?**
+*Answer:* Bcrypt inherently truncates input passwords at 72 bytes. In unhandled implementations with newer bcrypt libraries, passwords exceeding 72 bytes throw a runtime `ValueError`. Our implementation defensively slices `password[:72].encode("utf-8")` before hashing and verifying, preventing denial-of-service exceptions while maintaining 576 bits of entropy (far exceeding brute-force viability).
+
+**Q2: What is the architectural difference between storing sessions in Redis vs stateless JWT tokens?**
+*Answer:* Redis sessions allow instant revocation of an active session by deleting the key, but require a network hop to Redis on every single API request. Stateless JWTs eliminate the database/cache lookup entirely, allowing API gateways and worker nodes to verify identity locally using the shared public/symmetric secret. In TraceGuard, JWT tokens are paired with short expiration windows (`ACCESS_TOKEN_EXPIRE_MINUTES`) to balance performance and revocability.
+
+**Q3: How does FastAPI's `OAuth2PasswordBearer` interact with OpenAPI Swagger documentation?**
+*Answer:* `OAuth2PasswordBearer(tokenUrl=...)` registers a security scheme in FastAPI's generated OpenAPI specification (`/api/v1/openapi.json`). This automatically renders an "Authorize" button in Swagger UI (`/docs`), allowing engineers and API clients to log in and automatically inject the `Authorization: Bearer <token>` header across all protected test endpoints.

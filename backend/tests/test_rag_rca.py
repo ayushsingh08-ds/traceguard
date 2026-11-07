@@ -136,3 +136,4 @@ async def test_rca_engine_orchestration():
     assert len(db_report.tools_executed) >= 2
     assert mock_session.add.call_count >= 2
     mock_session.commit.assert_awaited_once()
+

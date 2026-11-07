@@ -45,3 +45,4 @@ class QueryErrorRateSpikeTool(DiagnosticTool):
             ],
             "degraded_upstream_dependencies": ["orders-db-primary", "auth-session-redis"],
         }
+

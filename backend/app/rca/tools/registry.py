@@ -60,3 +60,4 @@ class DiagnosticToolRegistry:
 
 
 diagnostic_tool_registry = DiagnosticToolRegistry()
+

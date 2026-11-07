@@ -39,6 +39,9 @@ class InMemorySlidingWindowCache:
         )
 
 
+_shared_in_memory_cache = InMemorySlidingWindowCache()
+
+
 class AlertDeduplicator:
     def __init__(
         self,
@@ -47,7 +50,7 @@ class AlertDeduplicator:
     ) -> None:
         self.redis_client = redis_client
         self.window_seconds = window_seconds
-        self._memory_fallback = InMemorySlidingWindowCache(window_seconds=window_seconds)
+        self._memory_fallback = _shared_in_memory_cache
 
     async def evaluate_and_record(self, fingerprint: str) -> DeduplicationResult:
         if self.redis_client is None:
