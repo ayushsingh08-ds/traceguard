@@ -42,3 +42,4 @@ async def test_deduplicator_isolates_independent_services():
     assert res2.is_duplicate is False
     assert res1.occurrence_count == 1
     assert res2.occurrence_count == 1
+

@@ -45,3 +45,4 @@ class CustomAlertParser(AlertParserStrategy):
             raw_payload=payload,
             timestamp=datetime.now(timezone.utc),
         )
+

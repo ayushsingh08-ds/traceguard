@@ -28,3 +28,4 @@ class AlertParserRegistry:
 
 
 alert_parser_registry = AlertParserRegistry()
+

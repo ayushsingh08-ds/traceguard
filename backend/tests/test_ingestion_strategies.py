@@ -70,3 +70,4 @@ def test_custom_parser_and_registry_resolution():
     assert event.title == "Payment gateway timeout rate > 5%"
     assert event.severity == SeverityLevel.SEV2
     assert event.environment == "staging"
+

@@ -343,3 +343,77 @@ If `ZCARD` returned 0, this is the first occurrence (create ticket); if $> 0$, i
 
 **Q3: How does the composite index `(status, severity, sla_deadline_at)` created in Phase 1 support this worker query?**
 *Answer:* The worker query filters by `status = 'TRIGGERED'`, orders by `severity` rank, and then orders by `sla_deadline_at`. Because the composite index has `status` first and `severity` and `sla_deadline_at` next, PostgreSQL can navigate directly to the unacknowledged records in index order without performing a full-table sequential scan, keeping worker polling overhead under 1 millisecond even with millions of historical incidents in the table.
+
+
+---
+
+## Phase 3 Modules: Engineering Deep Dive
+
+### 8. `backend/app/rca/tools/` (Deterministic Diagnostic Tool Registry & Tools)
+
+#### The Engineering "Why"
+- **Registry & Factory Pattern for Safe Tool Calling:** LLMs should never be given unbounded access to execute raw shell commands, database queries, or write operations during an active production outage. By encapsulating diagnostics into discrete `DiagnosticTool` classes with strict `parameters_schema` definitions and registering them in `DiagnosticToolRegistry`, we enforce a strictly read-only execution boundary.
+- **Uniform Telemetry Contracts:** Tools return standardized JSON objects (`active_connections`, `pool_saturation_pct`, `blocked_transactions`, `is_suspect_deployment`). Tool execution latency is tracked in milliseconds and returned within a frozen `ToolExecutionRecord`, ensuring observable audit traces.
+
+#### Failure Modes & Edge Cases
+- Execution crashes within a diagnostic tool: If an underlying API or DB inspection raises a connection error or timeout, `DiagnosticToolRegistry.execute()` catches the exception and returns `{"error": f"Tool execution failed: {str(e)}"}` inside the `result` dictionary rather than propagating unhandled exceptions and aborting the incident triage workflow.
+- Tool name typos or unregistered tool requests: `get(name)` returns `None` and `execute()` immediately raises `ValueError`, preventing arbitrary code execution.
+
+#### Interview Questions & Answers
+**Q1: Why isolate diagnostic tools behind deterministic Python classes instead of letting the LLM generate and execute SQL or Bash commands?**
+*Answer:* Permitting an LLM to generate executable shell commands or SQL scripts poses unacceptable security and stability risks during production outages. An LLM could hallucinate mutating statements (`DROP`, `DELETE`, `KILL`) or introduce catastrophic locking queries (`SELECT * ... FOR UPDATE`) that worsen the incident. Pre-built deterministic tools enforce read-only execution boundaries, sanitize parameters against JSON Schemas, and guarantee idempotent inspection of system state.
+
+**Q2: How does the Registry Pattern facilitate both OpenAI function-calling and internal deterministic routing?**
+*Answer:* The `DiagnosticToolRegistry` serves as a single source of truth. For LLM integration, `get_openai_tools_spec()` automatically compiles the registered tools' schemas into standard OpenAI/Gemini JSON function specifications (`{"type": "function", "function": {...}}`). For deterministic rule-based evaluation (offline or when skipping LLM steps), the same registry allows the engine to look up and invoke tools by string identifier with identical argument handling and execution timing.
+
+**Q3: What guarantees that diagnostic tools do not exacerbate database locks when the primary database is saturated?**
+*Answer:* Production diagnostic tools must query read replicas or system views (`pg_stat_activity`, `pg_locks`) with explicit statement timeouts (e.g., `SET statement_timeout = '2s'`) and uncommitted read isolation levels where appropriate. They never execute row locks or transactional writes, preventing the diagnostic agent from contributing to the deadlock cascade it is attempting to diagnose.
+
+---
+
+### 9. `backend/app/rca/indexer.py` (RAG Runbook Indexer & Hybrid Retrieval)
+
+#### The Engineering "Why"
+- **Hybrid Retrieval Architecture (SQL Metadata Filtering + Cosine Vector Similarity):** Pure semantic search often returns chunks from irrelevant services that happen to share generic phrasing (e.g., "timeout", "reboot"). By filtering on `service = :service OR service = 'global'` in SQL *before* computing vector distance, we dramatically increase precision and reduce embedding candidate search spaces.
+- **Markdown Context-Preserving Heading Chunking:** Naive fixed-character chunking splits sentences or tables across boundaries, severing operational context. Our chunker splits on Markdown heading tags (`##`, `###`), preserving the conceptual hierarchy (e.g., keeping "Diagnostic Steps" and "Remediation Protocol" intact within their respective chunks).
+- **Subword Character N-Gram Deterministic Embeddings:** For offline environments, local development, and deterministic test suites, `compute_deterministic_embedding` hashes words and character 3-grams/4-grams into unit-normalized 768-dimensional float vectors. This captures morphological variations (e.g., "postgres" and "postgresql" or "lock" and "deadlock") and guarantees mathematically sound cosine similarity ($||v|| = 1.0$) with zero network dependencies.
+
+#### Failure Modes & Edge Cases
+- Missing service runbooks: If a newly deployed microservice lacks a dedicated runbook, the SQL filter falls back to `service = 'global'`, retrieving edge proxy, gateway timeout, and general cluster remediation procedures.
+- Embedding scale drift: Raw vector dot products are sensitive to vector magnitude variations. All embeddings are strictly $L_2$-normalized ($v / ||v||_2$) prior to index storage, ensuring that cosine distance reflects true directional alignment.
+
+#### Interview Questions & Answers
+**Q1: What is the architectural advantage of hybrid search (SQL filter + pgvector) over vector-only search?**
+*Answer:* Vector-only search calculates distance across the entire corpus. If an engineer searches for "high memory saturation" in the `orders-service`, an unconstrained vector search might surface a runbook for the `analytics-batch` service simply because it discusses memory exhaustion. Hybrid retrieval applies strict relational predicates (`WHERE service IN ('orders-service', 'global')`) to eliminate out-of-domain chunks before computing cosine distance, guaranteeing domain relevance.
+
+**Q2: How does chunking strategy affect RAG precision during incident triage?**
+*Answer:* Incident runbooks are structured procedurally: Problem Definition $\to$ Telemetry Verification $\to$ Remediation. Fixed-size chunking (e.g., 500 characters) frequently severs the remediation command from the condition that triggers it. By chunking along Markdown heading boundaries (`##`, `###`), each chunk represents a self-contained operational unit, enabling the LLM to cite specific, coherent remediation steps.
+
+**Q3: How does pgvector's HNSW index handle concurrent vector insertions while queries are running?**
+*Answer:* Unlike `IVFFlat`, which relies on static centroids that degrade when new vectors are inserted without an index rebuild, `HNSW` maintains a multi-layer graph where each node has up to $M$ bidirectional connections. Concurrent inserts acquire node-level locks to stitch new vectors into the graph without locking the entire index, allowing live runbook updates without interrupting concurrent triage queries.
+
+---
+
+### 10. `backend/app/rca/engine.py` & `llm_adapter.py` (RCA Orchestrator & Fault-Tolerant LLM Adapter)
+
+#### The Engineering "Why"
+- **Zero-Trust Boundary on LLM Outputs:** LLMs are non-deterministic and prone to hallucination. `RootCauseReport` enforces strict Pydantic field validators:
+  - `confidence_score` must lie strictly within $[0.0, 1.0]$.
+  - `supporting_evidence` must be a non-empty list.
+  - `recommended_runbook_steps` must be a non-empty list.
+  Any output that violates these constraints is caught and rejected before persistence.
+- **Token Budget Truncation & Exponential Backoff:** Incoming telemetry payloads (logs, traces, tool outputs) can easily exceed model context windows. `truncate_to_token_budget` defensively caps prompt length to 6,000 characters. If the LLM API returns 429 (Rate Limit) or 503 (Overloaded), an exponential backoff loop retries up to 3 times ($2^{\text{attempt}}$ seconds) before falling back to the local deterministic inference engine.
+
+#### Failure Modes & Edge Cases
+- Complete LLM provider outage: If OpenAI/Gemini is down or no API key is provided, `_generate_deterministic_fallback` evaluates the executed tools' structured telemetry. If `check_database_locks` reported $>80\%$ pool saturation and active deadlocks, it constructs a verified RCA report citing the exact blocked PIDs and runbook remediation steps.
+- Empty search results: If no runbook chunks match, the engine falls back to default operational procedures, ensuring that the incident triage pipeline never blocks on missing documentation.
+
+#### Interview Questions & Answers
+**Q1: How do you prevent LLM context-window overflow when an incident generates hundreds of kilobytes of stack traces?**
+*Answer:* We apply a multi-stage data funnel. First, diagnostic tools summarize raw telemetry into compact structured metrics (`pool_saturation_pct`, `blocked_transactions_count`, `top_error_signatures`). Second, the RAG indexer retrieves only the top-$K$ most relevant runbook chunks. Finally, `truncate_to_token_budget` enforces a strict character ceiling before assembling the prompt, ensuring the payload never breaches model token limits.
+
+**Q2: What is the purpose of having a deterministic fallback engine when an LLM is available?**
+*Answer:* In high-availability incident response systems, the diagnostic pipeline cannot fail because a third-party LLM provider experiences an outage, rate-limiting, or billing cutoff. The deterministic fallback analyzes the exact same tool outputs using rule-based heuristics to produce a structured, actionable `RootCauseReport` with zero external dependencies, maintaining 99.99% system availability.
+
+**Q3: Why store the executed tools and runbook citations directly inside the `rca_reports` database record?**
+*Answer:* For auditability and post-incident reviews (post-mortems). Storing the exact state of what the diagnostic agent saw at the moment of the incident (the tool outputs, chunk citations, and model version) prevents ambiguity about why the agent reached its hypothesis and enables continuous evaluation of diagnostic accuracy over time.

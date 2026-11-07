@@ -81,3 +81,4 @@ class AlertDeduplicator:
         except (RedisError, ConnectionError, OSError):
             # Degrade gracefully to in-memory sliding window when Redis cluster is unreachable
             return self._memory_fallback.process(fingerprint)
+

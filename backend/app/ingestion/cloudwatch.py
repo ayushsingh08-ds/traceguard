@@ -69,3 +69,4 @@ class CloudWatchAlertParser(AlertParserStrategy):
             raw_payload=payload,
             timestamp=timestamp,
         )
+

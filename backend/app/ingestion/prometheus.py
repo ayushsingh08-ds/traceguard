@@ -58,3 +58,4 @@ class PrometheusAlertParser(AlertParserStrategy):
             raw_payload=payload,
             timestamp=timestamp,
         )
+

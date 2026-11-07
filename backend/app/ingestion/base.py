@@ -12,3 +12,4 @@ class AlertParserStrategy(ABC):
     @abstractmethod
     def parse(self, payload: Dict[str, Any]) -> IncidentEvent:
         pass
+
