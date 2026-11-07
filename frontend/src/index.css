@@ -12,3 +12,4 @@
 .solid-card {
   @apply bg-white dark:bg-darkcard border border-gray-200 dark:border-darkborder rounded-card shadow-solid dark:shadow-soliddark;
 }
+

@@ -108,3 +108,4 @@ async def update_incident_status(
     await session.refresh(incident)
 
     return incident
+

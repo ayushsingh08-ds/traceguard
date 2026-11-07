@@ -117,3 +117,4 @@ export function useIncidents(filters: UseIncidentsFilter = {}): UseIncidentsRetu
     updateIncidentStatusOptimistic,
   };
 }
+

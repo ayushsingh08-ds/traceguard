@@ -183,3 +183,4 @@ npm run dev
 | `GET` | `/api/v1/analytics/sla` | Computes real-time MTTA, MTTR, active breach counts, and SLA compliance |
 | `POST` | `/api/v1/auth/login` | Returns JWT Bearer token |
 | `GET` | `/health` | Service health status check |
+

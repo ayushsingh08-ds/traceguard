@@ -1,5 +1,6 @@
-import React from "react";
+import React, { useState } from "react";
 import { DiagnosticExecutionState, IncidentListItem } from "../types/incident";
+import { SortableStack } from "./SortableStack";
 
 interface RCAInspectorDrawerProps {
   incident: IncidentListItem | null;
@@ -8,12 +9,31 @@ interface RCAInspectorDrawerProps {
   onRunDiagnosis: () => void;
 }
 
+interface RemediationStepItem {
+  id: string;
+  step: string;
+}
+
 export const RCAInspectorDrawer: React.FC<RCAInspectorDrawerProps> = ({
   incident,
   state,
   onClose,
   onRunDiagnosis,
 }) => {
+  const [reorderedSteps, setReorderedSteps] = useState<RemediationStepItem[]>([]);
+
+  // Sync steps when diagnosis completes
+  React.useEffect(() => {
+    if (state.status === "completed") {
+      setReorderedSteps(
+        state.report.recommended_runbook_steps.map((step, idx) => ({
+          id: `step-${idx}-${step.slice(0, 15)}`,
+          step,
+        }))
+      );
+    }
+  }, [state]);
+
   if (!incident) return null;
 
   return (
@@ -125,22 +145,30 @@ export const RCAInspectorDrawer: React.FC<RCAInspectorDrawerProps> = ({
               </ul>
             </div>
 
-            {/* Recommended Runbook Actions */}
+            {/* Recommended Runbook Actions with Interactive Sortable Stack */}
             <div className="solid-card p-5 space-y-3">
-              <div className="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">
-                Recommended Remediation Steps
+              <div className="flex items-center justify-between">
+                <div className="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">
+                  Interactive Remediation Checklist (Drag to Prioritize)
+                </div>
+                <span className="text-[11px] font-mono text-gray-400 dark:text-gray-500">
+                  {reorderedSteps.length} steps
+                </span>
               </div>
-              <ol className="space-y-2">
-                {state.report.recommended_runbook_steps.map((step, idx) => (
-                  <li
-                    key={idx}
-                    className="text-xs text-gray-800 dark:text-gray-200 flex items-start space-x-2 bg-gray-50 dark:bg-darkborder/50 p-2.5 rounded-md border border-gray-200 dark:border-darkborder"
-                  >
-                    <span className="font-mono font-bold text-brand-600 dark:text-brand-400">{idx + 1}.</span>
-                    <span>{step}</span>
-                  </li>
-                ))}
-              </ol>
+              <SortableStack<RemediationStepItem>
+                items={reorderedSteps}
+                onReorder={setReorderedSteps}
+                renderItem={(item, isDragging) => (
+                  <div className="text-xs text-gray-800 dark:text-gray-200 flex items-start space-x-2">
+                    <span className="font-mono font-bold text-brand-600 dark:text-brand-400">
+                      {reorderedSteps.findIndex((s) => s.id === item.id) + 1}.
+                    </span>
+                    <span className={isDragging ? "font-medium text-brand-600 dark:text-brand-400" : ""}>
+                      {item.step}
+                    </span>
+                  </div>
+                )}
+              />
             </div>
 
             {/* Executed Tools Telemetry */}
@@ -198,3 +226,4 @@ export const RCAInspectorDrawer: React.FC<RCAInspectorDrawerProps> = ({
     </div>
   );
 };
+

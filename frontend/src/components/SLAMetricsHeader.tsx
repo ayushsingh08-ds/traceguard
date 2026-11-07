@@ -75,3 +75,4 @@ export const SLAMetricsHeader: React.FC<SLAMetricsHeaderProps> = ({ metrics, isL
     </div>
   );
 };
+

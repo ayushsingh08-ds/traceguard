@@ -82,3 +82,4 @@ export type DiagnosticExecutionState =
   | { status: "failed"; error: string };
 
 export type SLABadgeState = "healthy" | "warning" | "breached";
+

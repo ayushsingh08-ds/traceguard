@@ -3,8 +3,10 @@ import { apiClient } from "./api/client";
 import { IncidentTable } from "./components/IncidentTable";
 import { RCAInspectorDrawer } from "./components/RCAInspectorDrawer";
 import { SLAMetricsHeader } from "./components/SLAMetricsHeader";
+import { SortableStack } from "./components/SortableStack";
 import { Toast } from "./components/Toast";
 import { useIncidents } from "./hooks/useIncidents";
+import { useSLACountdown } from "./hooks/useSLACountdown";
 import {
   DiagnosticExecutionState,
   IncidentListItem,
@@ -14,11 +16,30 @@ import {
   SLAMetrics,
 } from "./types/incident";
 
+const SLABadgeWrapper: React.FC<{ deadlineIso: string; isResolved: boolean }> = ({
+  deadlineIso,
+  isResolved,
+}) => {
+  const { formattedText, badgeState } = useSLACountdown(deadlineIso, isResolved);
+  const badgeStyles: Record<string, string> = {
+    healthy: "bg-emerald-50 text-emerald-700 border-emerald-300 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800",
+    warning: "bg-amber-50 text-amber-700 border-amber-300 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-800",
+    breached: "bg-red-50 text-red-700 border-red-300 dark:bg-red-950/40 dark:text-red-300 dark:border-red-800 font-bold",
+  };
+
+  return (
+    <span className={`inline-block px-2.5 py-1 text-xs font-mono rounded-md border ${badgeStyles[badgeState]}`}>
+      {formattedText}
+    </span>
+  );
+};
+
 export const App: React.FC = () => {
   const [darkMode, setDarkMode] = useState<boolean>(() => {
     return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
   });
 
+  const [viewMode, setViewMode] = useState<"table" | "stack">("table");
   const [severityFilter, setSeverityFilter] = useState<SeverityLevel | undefined>(undefined);
   const [statusFilter, setStatusFilter] = useState<IncidentStatus | undefined>(undefined);
   const [serviceSearch, setServiceSearch] = useState<string>("");
@@ -41,6 +62,12 @@ export const App: React.FC = () => {
     status: statusFilter,
     service: serviceSearch || undefined,
   });
+
+  const [stackedIncidents, setStackedIncidents] = useState<IncidentListItem[]>([]);
+
+  useEffect(() => {
+    setStackedIncidents(incidents);
+  }, [incidents]);
 
   useEffect(() => {
     if (darkMode) {
@@ -206,22 +233,125 @@ export const App: React.FC = () => {
             />
           </div>
 
-          <button
-            onClick={() => refetch()}
-            className="text-xs px-3 py-1.5 rounded-md border border-gray-300 dark:border-darkborder bg-white dark:bg-darkcard hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors shadow-sm text-gray-700 dark:text-gray-300"
-          >
-            Refresh
-          </button>
+          <div className="flex items-center space-x-2">
+            <div className="flex rounded-md border border-gray-300 dark:border-darkborder overflow-hidden p-0.5 bg-gray-100 dark:bg-darkcard">
+              <button
+                onClick={() => setViewMode("table")}
+                className={`text-xs px-3 py-1 rounded-md font-medium transition-colors ${
+                  viewMode === "table"
+                    ? "bg-white dark:bg-darkborder text-gray-900 dark:text-gray-100 shadow-sm font-semibold"
+                    : "text-gray-600 dark:text-gray-400 hover:text-gray-900"
+                }`}
+              >
+                Table View
+              </button>
+              <button
+                onClick={() => setViewMode("stack")}
+                className={`text-xs px-3 py-1 rounded-md font-medium transition-colors ${
+                  viewMode === "stack"
+                    ? "bg-brand-500 text-white shadow-sm font-semibold"
+                    : "text-gray-600 dark:text-gray-400 hover:text-gray-900"
+                }`}
+              >
+                Sortable Stack
+              </button>
+            </div>
+
+            <button
+              onClick={() => refetch()}
+              className="text-xs px-3 py-1.5 rounded-md border border-gray-300 dark:border-darkborder bg-white dark:bg-darkcard hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors shadow-sm text-gray-700 dark:text-gray-300"
+            >
+              Refresh
+            </button>
+          </div>
         </div>
 
-        {/* Incident Table */}
-        <IncidentTable
-          incidents={incidents}
-          isLoading={isIncidentsLoading}
-          onStatusChange={handleStatusChange}
-          onSelectIncidentForRCA={handleSelectIncidentForRCA}
-          selectedIncidentId={selectedIncident?.id}
-        />
+        {/* View Mode: Table vs Interactive Sortable Stack */}
+        {viewMode === "table" ? (
+          <IncidentTable
+            incidents={incidents}
+            isLoading={isIncidentsLoading}
+            onStatusChange={handleStatusChange}
+            onSelectIncidentForRCA={handleSelectIncidentForRCA}
+            selectedIncidentId={selectedIncident?.id}
+          />
+        ) : (
+          <div className="space-y-3">
+            <div className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+              Interactive Triage Priority Queue (Drag to Reorder War-Room Focus)
+            </div>
+            <SortableStack<IncidentListItem>
+              items={stackedIncidents}
+              onReorder={setStackedIncidents}
+              renderItem={(incident, isDragging) => (
+                <div className={`flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${isDragging ? "opacity-90" : ""}`}>
+                  <div className="space-y-1">
+                    <div className="flex items-center space-x-2">
+                      <span
+                        className={`inline-block px-2 py-0.5 text-xs font-semibold rounded-md border ${
+                          incident.severity === "Sev-1"
+                            ? "bg-red-100 text-red-800 border-red-200 dark:bg-red-900/40 dark:text-red-300 dark:border-red-800"
+                            : incident.severity === "Sev-2"
+                            ? "bg-brand-100 text-brand-800 border-brand-200 dark:bg-brand-900/40 dark:text-brand-300 dark:border-brand-800"
+                            : "bg-gray-100 text-gray-800 border-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-700"
+                        }`}
+                      >
+                        {incident.severity}
+                      </span>
+                      <span className="font-semibold text-sm text-gray-900 dark:text-gray-100">
+                        {incident.title}
+                      </span>
+                      <span className="px-1.5 py-0.5 text-xs font-mono font-medium rounded-md bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300">
+                        x{incident.occurrence_count}
+                      </span>
+                    </div>
+                    <div className="text-xs text-gray-500 dark:text-gray-400 font-mono">
+                      {incident.service} &middot; {incident.environment} &middot; Status: {incident.status}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center space-x-2">
+                    <SLABadgeWrapper
+                      deadlineIso={incident.sla_deadline_at}
+                      isResolved={incident.status === "RESOLVED"}
+                    />
+                    {incident.status === "TRIGGERED" && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleStatusChange(incident.id, "ACKNOWLEDGED");
+                        }}
+                        className="px-2.5 py-1 text-xs font-medium rounded-md bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 dark:bg-darkcard dark:border-gray-700 dark:text-gray-200"
+                      >
+                        Acknowledge
+                      </button>
+                    )}
+                    {incident.status !== "RESOLVED" && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleStatusChange(incident.id, "RESOLVED");
+                        }}
+                        className="px-2.5 py-1 text-xs font-medium rounded-md bg-emerald-600 text-white hover:bg-emerald-700"
+                      >
+                        Resolve
+                      </button>
+                    )}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleSelectIncidentForRCA(incident);
+                      }}
+                      className="px-2.5 py-1 text-xs font-medium rounded-md bg-brand-500 text-white hover:bg-brand-600"
+                    >
+                      Diagnose RCA
+                    </button>
+                  </div>
+                </div>
+              )}
+            />
+          </div>
+        )}
       </main>
 
       {/* Slide-over RCA Inspector Drawer */}
@@ -241,3 +371,4 @@ export const App: React.FC = () => {
     </div>
   );
 };
+

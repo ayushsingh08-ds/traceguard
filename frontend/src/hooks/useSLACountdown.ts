@@ -64,3 +64,4 @@ export function useSLACountdown(
     badgeState: isWarning ? "warning" : "healthy",
   };
 }
+

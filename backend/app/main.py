@@ -55,3 +55,4 @@ app.include_router(api_router, prefix=settings.API_V1_STR)
 @app.get("/health", tags=["Health"])
 async def health_check() -> dict:
     return {"status": "healthy", "service": "traceguard-backend"}
+

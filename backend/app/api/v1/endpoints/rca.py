@@ -50,3 +50,4 @@ async def get_latest_rca_report(
             detail=f"No RCA report generated for incident '{incident_id}'",
         )
     return report
+

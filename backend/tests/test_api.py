@@ -165,3 +165,4 @@ async def test_sla_analytics_calculation():
         assert "mean_time_to_resolve_seconds" in data
         assert "sla_compliance_rate" in data
         assert "total_active_incidents" in data
+

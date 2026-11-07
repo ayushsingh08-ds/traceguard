@@ -629,3 +629,31 @@ If a developer adds a new state variant to the union and forgets to handle it in
 
 **Q3: What is the structure of `ApiError` and how does it improve debugging compared to raw Error instances?**
 *Answer:* `ApiError` extends the native `Error` class and adds explicit `status: number` and `details: unknown` fields. This enables UI catch blocks to check `err instanceof ApiError` and branch specifically on HTTP status codes (e.g., 401 Unauthorized vs 404 Not Found vs 422 Validation Error) rather than inspecting fragile error message strings.
+
+
+---
+
+### 19. `frontend/src/components/SortableStack.tsx` (Physics-Based Sortable Stack & Reorderable Runbook Actions)
+
+#### The Engineering "Why"
+- **Incident War-Room Priority Reordering:** During complex outages, on-call engineers often need to adjust incident triage focus manually (e.g., pinning a blocking database deadlock ahead of peripheral cache warnings). The `SortableStack` component provides tactile, physics-based reordering with spring animations (`motion/react` `Reorder.Group`), keyboard accessibility, and a non-destructive multi-level undo stack.
+- **Dynamic Remediation Step Re-Sequencing:** LLM-generated runbook recommendations provide an initial sequence of actions, but live conditions may require engineers to invert steps (e.g., executing step 3 before step 1). In the `RCAInspectorDrawer`, the remediation checklist is rendered inside `SortableStack`, allowing engineers to drag and re-order action items live before sharing the runbook protocol with the team.
+
+#### Failure Modes & Edge Cases
+- Accidental drag reorders during high-stress triage: An integrated `Undo Reorder` stack stores snapshots of the last 5 order states, allowing instantaneous one-click rollback of unintentional drag movements.
+- High render frequency during drag gestures: Drag movements are handled natively by GPU-accelerated CSS transforms (`translate3d`) managed by Motion, keeping browser frame rates locked at 60 FPS without triggering continuous full-page re-renders.
+
+#### Interview Questions & Answers
+**Q1: How does `Reorder.Group` from Motion differ from traditional HTML5 Drag and Drop (`draggable=true`)?**
+*Answer:* HTML5 Native Drag and Drop creates a ghost bitmap image of the dragged element, provides poor touch screen support, and lacks built-in layout interpolation—meaning non-dragged items snap abruptly into place rather than gliding smoothly. Motion's `Reorder` component tracks element bounding boxes using the Web Animations API / FLIP (First, Last, Invert, Play) technique, animating sibling items out of the way with fluid spring physics and providing full pointer and touch event normalization.
+
+**Q2: What is the FLIP animation technique and why is it crucial for 60 FPS reordering lists?**
+*Answer:* FLIP stands for **First, Last, Invert, Play**:
+1. **First:** Records the initial layout position of every element via `getBoundingClientRect()`.
+2. **Last:** Applies the state change and records the final layout position.
+3. **Invert:** Applies a CSS `transform: translate(dx, dy)` so the element visually appears at its first position with zero layout reflow.
+4. **Play:** Transitions `transform` to `translate(0, 0)`.
+Because CSS transforms do not trigger layout or paint cycles in the browser, FLIP keeps reordering smooth even on mobile devices.
+
+**Q3: How does the `SortableStack` maintain accessibility (a11y) for screen reader and keyboard users?**
+*Answer:* Touch or mouse drag is inaccessible to keyboard-only users. The handle and items support keyboard navigation (Arrow Up, Arrow Down, Home, End) to shift list position without pointer interaction, accompanied by ARIA live region status announcements of the new list index.
